@@ -1,13 +1,14 @@
 #![feature(trait_alias)]
+
 use const_format::concatcp;
 use nom::branch::alt;
-use nom::bytes::complete::{escaped, tag};
+use nom::bytes::complete::{escaped, is_not, tag};
 use nom::character::complete::{char, digit1, none_of, one_of};
-use nom::combinator::{map, opt};
+use nom::combinator::{map, opt, value};
 use nom::error::Error;
 use nom::multi::{many0, many1};
 use nom::number::complete::double;
-use nom::sequence::{delimited, separated_pair, terminated, tuple};
+use nom::sequence::{delimited, pair, preceded, separated_pair, terminated, tuple};
 use nom::Parser as NomParser;
 use std::str::FromStr;
 
@@ -60,7 +61,7 @@ const TAG_VALUE_SPECIAL_CHARS: &str = ",= ";
 const FIELD_KEY_SPECIAL_CHARS: &str = ",= ";
 const FIELD_VALUE_SPECIAL_CHARS: &str = r#""\"#;
 
-fn parse_measurement_naive<'a>() -> impl Parser<'a, &'a str> {
+fn parse_measurement<'a>() -> impl Parser<'a, &'a str> {
     escaped(
         none_of(concatcp!(
             BASE_EXCLUDED_CHARS,
@@ -105,8 +106,8 @@ fn parse_tags<'a>() -> impl Parser<'a, Vec<Tag<'a>>> {
 
 fn parse_measurement_and_tags<'a>() -> impl Parser<'a, (&'a str, Vec<Tag<'a>>)> {
     alt((
-        separated_pair(parse_measurement_naive(), char(','), parse_tags()),
-        parse_measurement_naive().map(|measurement| (measurement, vec![])),
+        separated_pair(parse_measurement(), char(','), parse_tags()),
+        parse_measurement().map(|measurement| (measurement, vec![])),
     ))
 }
 
@@ -178,7 +179,7 @@ fn parse_field<'a>() -> impl Parser<'a, Field<'a>> {
                 FIELD_KEY_SPECIAL_CHARS
             )),
             '\\',
-            one_of(r#",= "#),
+            one_of(",= "),
         ),
         char('='),
         parse_field_value(),
@@ -194,27 +195,34 @@ fn parse_timestamp<'a>() -> impl Parser<'a, i64> {
     parse_i64()
 }
 
+fn parse_comment_line<'a>() -> impl Parser<'a, &'a str> {
+    delimited(char('#'), is_not("\n"), char('\n'))
+}
+
 fn parse_ilp_line<'a>() -> impl Parser<'a, Measurement<'a>> {
     tuple((
+        opt(parse_comment_line()),
         parse_measurement_and_tags(),
         char(' '),
         parse_fields(),
         opt(tuple((char(' '), parse_timestamp()))),
+        char('\n'),
     ))
-    .map(|((measurement, tags), _, fields, maybe_timestamp)| {
-        let timestamp = maybe_timestamp.map(|(_, ts)| ts);
-        Measurement {
-            name: measurement,
-            tags,
-            fields,
-            timestamp,
-        }
-    })
+    .map(
+        |(_comment_line, (measurement, tags), _ws, fields, maybe_timestamp, _)| {
+            let timestamp = maybe_timestamp.map(|(_, ts)| ts);
+            Measurement {
+                name: measurement,
+                tags,
+                fields,
+                timestamp,
+            }
+        },
+    )
 }
 
 fn parse_ilp_lines<'a>() -> impl Parser<'a, Vec<Measurement<'a>>> {
-    // TODO: does each line need EOL in order to be valid?
-    many1(terminated(parse_ilp_line(), char('\n')))
+    many1(parse_ilp_line())
 }
 
 pub fn parse(value: &str) -> Vec<Measurement> {
@@ -231,15 +239,13 @@ mod tests {
 
         #[test]
         fn parse_measurement_simple_string() {
-            let (_rest, result) = parse_measurement_naive().parse("myMeasurement").unwrap();
+            let (_rest, result) = parse_measurement().parse("myMeasurement").unwrap();
             assert_eq!(result, "myMeasurement");
         }
 
         #[test]
         fn parse_measurement_with_escape_chars() {
-            let (_rest, result) = parse_measurement_naive()
-                .parse(r#"my\,\ Measurement"#)
-                .unwrap();
+            let (_rest, result) = parse_measurement().parse(r#"my\,\ Measurement"#).unwrap();
             assert_eq!(result, r#"my\,\ Measurement"#);
         }
     }
@@ -665,7 +671,7 @@ mod tests {
     fn parse_ilp_line_parses() {
         let (_rest, result) = parse_ilp_line()
             .parse(
-                "myMeasurement,tag1=value1,tag2=value2 fieldKey=\"fieldValue\" 1556813561098000000",
+                "myMeasurement,tag1=value1,tag2=value2 fieldKey=\"fieldValue\" 1556813561098000000\n",
             )
             .unwrap();
         assert_eq!(
@@ -694,7 +700,7 @@ mod tests {
     #[test]
     fn parse_ilp_line_no_timestamp_parses() {
         let (_rest, result) = parse_ilp_line()
-            .parse("myMeasurement fieldKey=\"fieldValue\"")
+            .parse("myMeasurement fieldKey=\"fieldValue\"\n")
             .unwrap();
         assert_eq!(
             result,
@@ -713,7 +719,7 @@ mod tests {
     #[test]
     fn parse_ilp_line_with_string_in_string_parses() {
         let (_rest, result) = parse_ilp_line()
-            .parse(r#"myMeasurement fieldKey="\"string\" within a string""#)
+            .parse("myMeasurement fieldKey=\"\\\"string\\\" within a string\"\n")
             .unwrap();
         assert_eq!(
             result,
@@ -730,9 +736,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_ilp_line_with_comment_parses() {
+        let (_rest, result) = parse_ilp_line()
+            .parse("# haha - this is a comment!\nmyMeasurement fieldKey=\"fieldValue\"\n")
+            .unwrap();
+        assert_eq!(
+            result,
+            Measurement {
+                name: "myMeasurement",
+                tags: vec![],
+                fields: vec![Field {
+                    key: "fieldKey",
+                    value: FieldValue::String("fieldValue")
+                }],
+                timestamp: None
+            }
+        )
+    }
+
+    #[test]
     fn parse_ilp_spaces_in_tags_keys_line_parses() {
         let (_rest, result) = parse_ilp_line()
-            .parse(r#"myMeasurement,tag\ Key1=tag\ Value1,tag\ Key2=tag\ Value2 fieldKey=100"#)
+            .parse("myMeasurement,tag\\ Key1=tag\\ Value1,tag\\ Key2=tag\\ Value2 fieldKey=100\n")
             .unwrap();
         assert_eq!(
             result,
@@ -760,7 +785,7 @@ mod tests {
     #[test]
     fn parse_ilp_emoji_line_parses() {
         let (_rest, result) = parse_ilp_line()
-            .parse("myMeasurement,tagKey=🍭 fieldKey=\"Launch 🚀\" 1556813561098000000")
+            .parse("myMeasurement,tagKey=🍭 fieldKey=\"Launch 🚀\" 1556813561098000000\n")
             .unwrap();
         assert_eq!(
             result,
