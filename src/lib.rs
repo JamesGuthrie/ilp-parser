@@ -2,13 +2,13 @@
 
 use const_format::concatcp;
 use nom::branch::alt;
-use nom::bytes::complete::{escaped, is_not, tag};
+use nom::bytes::complete::{escaped, is_not, tag, take_until};
 use nom::character::complete::{char, digit1, none_of, one_of};
-use nom::combinator::{map, opt, value};
-use nom::error::Error;
+use nom::combinator::{map, opt};
+use nom::error::{Error, ErrorKind, ParseError};
 use nom::multi::{many0, many1};
 use nom::number::complete::double;
-use nom::sequence::{delimited, pair, preceded, separated_pair, terminated, tuple};
+use nom::sequence::{delimited, preceded, separated_pair, terminated, tuple};
 use nom::Parser as NomParser;
 use std::str::FromStr;
 
@@ -195,39 +195,71 @@ fn parse_timestamp<'a>() -> impl Parser<'a, i64> {
     parse_i64()
 }
 
-fn parse_comment_line<'a>() -> impl Parser<'a, &'a str> {
-    delimited(char('#'), is_not("\n"), char('\n'))
+#[derive(Debug, PartialEq)]
+enum Line<'a> {
+    Empty,
+    Comment(&'a str),
+    Measurement(Measurement<'a>),
+    ParseError(String),
 }
 
-fn parse_ilp_line<'a>() -> impl Parser<'a, Measurement<'a>> {
-    tuple((
-        opt(parse_comment_line()),
-        parse_measurement_and_tags(),
-        char(' '),
-        parse_fields(),
-        opt(tuple((char(' '), parse_timestamp()))),
-        char('\n'),
-    ))
-    .map(
-        |(_comment_line, (measurement, tags), _ws, fields, maybe_timestamp, _)| {
+fn parse_comment<'a>() -> impl Parser<'a, Line<'a>> {
+    preceded(char('#'), is_not("\n")).map(Line::Comment)
+}
+
+fn parse_ilp<'a>() -> impl Parser<'a, Line<'a>> {
+    |input| {
+        let mut parser = tuple((
+            parse_measurement_and_tags(),
+            char(' '),
+            parse_fields(),
+            opt(tuple((char(' '), parse_timestamp()))),
+        ))
+        .map(|((name, tags), _ws, fields, maybe_timestamp)| {
             let timestamp = maybe_timestamp.map(|(_, ts)| ts);
-            Measurement {
-                name: measurement,
+            Line::Measurement(Measurement {
+                name,
                 tags,
                 fields,
                 timestamp,
-            }
-        },
-    )
+            })
+        });
+
+        match parser.parse(input) {
+            Ok(r) => Ok(r),
+            Err(e) => Ok((input, Line::ParseError(e.to_string()))),
+        }
+    }
 }
 
-fn parse_ilp_lines<'a>() -> impl Parser<'a, Vec<Measurement<'a>>> {
+fn empty<'a>() -> impl Parser<'a, Line<'a>> {
+    |input: &'a str| match input.len() {
+        0 => Ok((input, Line::Empty)),
+        _ => Err(nom::Err::Error(Error::from_error_kind(
+            input,
+            ErrorKind::NonEmpty,
+        ))),
+    }
+}
+
+fn parse_ilp_line<'a>() -> impl Parser<'a, Line<'a>> {
+    terminated(take_until("\n"), char('\n')).and_then(alt((empty(), parse_comment(), parse_ilp())))
+}
+
+fn parse_ilp_lines<'a>() -> impl Parser<'a, Vec<Line<'a>>> {
     many1(parse_ilp_line())
 }
 
-pub fn parse(value: &str) -> Vec<Measurement> {
+pub fn parse(value: &str) -> Vec<Result<Measurement, String>> {
     let (_rest, result) = parse_ilp_lines().parse(value).unwrap();
     result
+        .into_iter()
+        .filter_map(|v| match v {
+            Line::Empty | Line::Comment(_) => None,
+            Line::Measurement(m) => Some(Ok(m)),
+            Line::ParseError(e) => Some(Err(e)),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -676,7 +708,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            Measurement {
+            Line::Measurement(Measurement {
                 name: "myMeasurement",
                 tags: vec![
                     Tag {
@@ -693,7 +725,7 @@ mod tests {
                     value: FieldValue::String("fieldValue")
                 }],
                 timestamp: Some(1556813561098000000i64)
-            }
+            })
         )
     }
 
@@ -704,7 +736,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            Measurement {
+            Line::Measurement(Measurement {
                 name: "myMeasurement",
                 tags: vec![],
                 fields: vec![Field {
@@ -712,7 +744,7 @@ mod tests {
                     value: FieldValue::String("fieldValue")
                 }],
                 timestamp: None
-            }
+            })
         )
     }
 
@@ -723,7 +755,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            Measurement {
+            Line::Measurement(Measurement {
                 name: "myMeasurement",
                 tags: vec![],
                 fields: vec![Field {
@@ -731,7 +763,7 @@ mod tests {
                     value: FieldValue::String(r#"\"string\" within a string"#)
                 }],
                 timestamp: None
-            }
+            })
         )
     }
 
@@ -740,18 +772,7 @@ mod tests {
         let (_rest, result) = parse_ilp_line()
             .parse("# haha - this is a comment!\nmyMeasurement fieldKey=\"fieldValue\"\n")
             .unwrap();
-        assert_eq!(
-            result,
-            Measurement {
-                name: "myMeasurement",
-                tags: vec![],
-                fields: vec![Field {
-                    key: "fieldKey",
-                    value: FieldValue::String("fieldValue")
-                }],
-                timestamp: None
-            }
-        )
+        assert_eq!(result, Line::Comment(" haha - this is a comment!"))
     }
 
     #[test]
@@ -761,7 +782,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            Measurement {
+            Line::Measurement(Measurement {
                 name: "myMeasurement",
                 tags: vec![
                     Tag {
@@ -778,7 +799,7 @@ mod tests {
                     value: FieldValue::Float(100f64)
                 }],
                 timestamp: None
-            }
+            })
         )
     }
 
@@ -789,7 +810,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            Measurement {
+            Line::Measurement(Measurement {
                 name: "myMeasurement",
                 tags: vec![Tag {
                     key: "tagKey",
@@ -800,7 +821,54 @@ mod tests {
                     value: FieldValue::String("Launch 🚀")
                 }],
                 timestamp: Some(1556813561098000000i64)
-            }
+            })
         )
+    }
+
+    #[test]
+    fn parse_multiple_lines_with_error() {
+        let result = parse(
+            r#"
+m1 value=12.0
+m2 value=∑¹2a.0
+m3 value=32.0
+m4 value=42.0
+        "#,
+        );
+        assert_eq!(
+            result,
+            vec![
+                Ok(Measurement {
+                    name: "m1",
+                    tags: vec![],
+                    fields: vec![Field {
+                        key: "value",
+                        value: FieldValue::Float(12.0)
+                    }],
+                    timestamp: None
+                }),
+                Err(String::from(
+                    "Parsing Error: Error { input: \"∑¹2a.0\", code: Float }"
+                )),
+                Ok(Measurement {
+                    name: "m3",
+                    tags: vec![],
+                    fields: vec![Field {
+                        key: "value",
+                        value: FieldValue::Float(32.0)
+                    }],
+                    timestamp: None
+                }),
+                Ok(Measurement {
+                    name: "m4",
+                    tags: vec![],
+                    fields: vec![Field {
+                        key: "value",
+                        value: FieldValue::Float(42.0)
+                    }],
+                    timestamp: None
+                }),
+            ]
+        );
     }
 }
