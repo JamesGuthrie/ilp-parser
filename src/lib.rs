@@ -125,7 +125,7 @@ fn parse_string_field_value<'a>() -> impl Parser<'a, FieldValue<'a>> {
         ),
         char('"'),
     )
-    .map(|v| FieldValue::String(v))
+    .map(FieldValue::String)
 }
 
 fn parse_boolean_field_value<'a>() -> impl Parser<'a, FieldValue<'a>> {
